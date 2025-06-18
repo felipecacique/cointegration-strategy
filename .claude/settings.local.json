@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir:*)",
+      "Bash(python:*)",
+      "Bash(pip3 install:*)",
+      "Bash(pip install:*)",
+      "Bash(find:*)",
+      "Bash(sqlite3:*)",
+      "Bash(ls:*)"
+    ],
+    "deny": []
+  }
+}
