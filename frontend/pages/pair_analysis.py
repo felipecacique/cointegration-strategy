@@ -404,8 +404,9 @@ def run_bulk_pair_analysis(universe, min_correlation, min_half_life,
             progress_bar.progress(progress_pct)
             status_text.text(message)
         
-        # Create pair selector
-        selector = PairSelector()
+        # Create API and pair selector with same instance
+        api = MarketDataAPI()
+        selector = PairSelector(data_api=api)
         
         # Find pairs with progress tracking
         status_text.text("🔍 Starting cointegration analysis...")

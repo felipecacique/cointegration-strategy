@@ -7,6 +7,7 @@ import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
+import time
 
 from backtest.engine import BacktestEngine
 from data.api import MarketDataAPI
@@ -22,16 +23,47 @@ def render_backtesting_page():
     st.title("📈 Backtesting")
     st.markdown("Historical simulation and performance analysis of the pairs trading strategy")
     
+    # Load default config values
+    from config.settings import CONFIG
+    
+    # Check if reset was requested
+    if st.session_state.get('reset_requested', False):
+        # Clear the reset flag
+        st.session_state.reset_requested = False
+    
     # Backtest configuration
     with st.expander("🔧 Backtest Configuration", expanded=True):
         col1, col2, col3 = st.columns(3)
         
         with col1:
             st.subheader("📅 Time Period")
-            start_date = st.date_input("Start Date", 
-                                     datetime(2022, 1, 1))
-            end_date = st.date_input("End Date", 
-                                   datetime(2023, 12, 31))
+            
+            # Get available date range from database
+            try:
+                from data.api import MarketDataAPI
+                api = MarketDataAPI()
+                date_range = api.storage.get_date_range()
+                
+                if date_range.get('min_date') and date_range.get('max_date'):
+                    min_date = pd.to_datetime(date_range['min_date']).date()
+                    max_date = pd.to_datetime(date_range['max_date']).date()
+                    
+                    # Set default dates within available range
+                    default_start = max(min_date, datetime(2023, 1, 1).date())
+                    default_end = min(max_date, datetime(2024, 12, 31).date())
+                    
+                    st.caption(f"📊 Available data: {min_date} to {max_date}")
+                else:
+                    default_start = datetime(2023, 1, 1).date()
+                    default_end = datetime(2024, 12, 31).date()
+                    
+            except Exception as e:
+                default_start = datetime(2023, 1, 1).date()
+                default_end = datetime(2024, 12, 31).date()
+                st.warning(f"Could not load date range: {e}")
+            
+            start_date = st.date_input("Start Date", default_start)
+            end_date = st.date_input("End Date", default_end)
             
             universe = st.selectbox("Universe", 
                                   ["IBOV", "IBRX100", "ALL"])
@@ -39,24 +71,36 @@ def render_backtesting_page():
         with col2:
             st.subheader("💰 Capital Settings")
             initial_capital = st.number_input("Initial Capital (R$)", 
-                                            10000, 10000000, 100000, 10000)
+                                            10000, 10000000, 
+                                            value=CONFIG['trading']['initial_capital'], 
+                                            step=10000, key='initial_capital')
             
             max_position_size = st.slider("Max Position Size (%)", 
-                                        1, 20, 10, 1) / 100
+                                        1, 20, 
+                                        value=int(CONFIG['trading']['max_position_size'] * 100),
+                                        step=1, key='max_position_size_slider') / 100
             
             max_active_pairs = st.number_input("Max Active Pairs", 
-                                             1, 50, 10, 1)
+                                             1, 50, 
+                                             value=CONFIG['trading']['max_active_pairs'],
+                                             step=1, key='max_active_pairs')
         
         with col3:
             st.subheader("📊 Strategy Parameters")
             entry_z_score = st.number_input("Entry Z-Score", 
-                                          1.0, 5.0, 2.0, 0.1)
+                                          1.0, 5.0, 
+                                          value=CONFIG['trading']['entry_z_score'],
+                                          step=0.1, key='entry_z_score')
             
             exit_z_score = st.number_input("Exit Z-Score", 
-                                         0.1, 2.0, 0.5, 0.1)
+                                         0.1, 2.0, 
+                                         value=CONFIG['trading']['exit_z_score'],
+                                         step=0.1, key='exit_z_score')
             
             stop_loss_z_score = st.number_input("Stop-Loss Z-Score", 
-                                               2.0, 10.0, 3.0, 0.1)
+                                               2.0, 10.0, 
+                                               value=CONFIG['trading']['stop_loss_z_score'],
+                                               step=0.1, key='stop_loss_z_score')
         
         # Advanced settings
         with st.expander("⚙️ Advanced Settings"):
@@ -64,24 +108,112 @@ def render_backtesting_page():
             
             with col1:
                 lookback_window = st.number_input("Lookback Window (days)", 
-                                                100, 500, 252, 10)
+                                                100, 500, 
+                                                value=CONFIG['strategy']['lookback_window'],
+                                                step=10, key='lookback_window')
                 trading_window = st.number_input("Trading Window (days)", 
-                                               10, 200, 63, 5)
+                                               10, 200, 
+                                               value=CONFIG['strategy']['trading_window'],
+                                               step=5, key='trading_window')
             
             with col2:
                 rebalance_frequency = st.number_input("Rebalance Frequency (days)", 
-                                                    1, 100, 21, 1)
+                                                    1, 100, 
+                                                    value=CONFIG['strategy']['rebalance_frequency'],
+                                                    step=1, key='rebalance_frequency')
                 commission_rate = st.number_input("Commission Rate (%)", 
-                                                0.0, 1.0, 0.3, 0.1) / 100
+                                                0.0, 1.0, 
+                                                value=CONFIG['trading']['commission_rate'] * 100,
+                                                step=0.1, key='commission_rate_input') / 100
         
-        # Run backtest button
-        col1, col2, col3 = st.columns([1, 2, 1])
+        # Cointegration criteria section
+        with st.expander("🔬 Cointegration Criteria"):
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                p_value_threshold = st.number_input("P-value Threshold", 
+                                                   0.001, 0.20, 
+                                                   value=CONFIG['strategy']['p_value_threshold'],
+                                                   step=0.005, key='p_value_threshold',
+                                                   help="Maximum p-value for cointegration test (0.05 = 95% confidence)")
+                min_correlation = st.number_input("Min Correlation", 
+                                                 0.3, 0.95, 
+                                                 value=CONFIG['strategy']['min_correlation'],
+                                                 step=0.05, key='min_correlation',
+                                                 help="Minimum absolute correlation between pairs")
+            
+            with col2:
+                min_half_life = st.number_input("Min Half-Life (days)", 
+                                               1, 50, 
+                                               value=CONFIG['strategy']['min_half_life'],
+                                               step=1, key='min_half_life',
+                                               help="Minimum mean reversion speed")
+                max_half_life = st.number_input("Max Half-Life (days)", 
+                                               10, 200, 
+                                               value=CONFIG['strategy']['max_half_life'],
+                                               step=5, key='max_half_life',
+                                               help="Maximum mean reversion speed")
+            
+            with col3:
+                top_pairs = st.number_input("Top Pairs to Select", 
+                                           5, 50, 
+                                           value=CONFIG['strategy']['top_pairs'],
+                                           step=1, key='top_pairs',
+                                           help="Number of best pairs to trade")
+                sector_matching = st.checkbox("Same Sector Only", 
+                                             value=CONFIG['strategy']['sector_matching'],
+                                             key='sector_matching',
+                                             help="Only trade pairs from the same sector")
+        
+        # Risk management section
+        with st.expander("⚠️ Risk Management"):
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                force_close_missing_days = st.number_input("Force Close Missing Data (days)", 
+                                                         3, 30, 
+                                                         value=CONFIG['trading']['force_close_missing_days'],
+                                                         step=1, key='force_close_missing_days',
+                                                         help="Force close position after X consecutive days without data")
+            
+            with col2:
+                max_holding_period = st.number_input("Max Holding Period (days)", 
+                                                    7, 365, 
+                                                    value=CONFIG['trading']['max_holding_period'],
+                                                    step=1, key='max_holding_period',
+                                                    help="Maximum days to hold any position (timeout)")
+        
+        # Run backtest and reset buttons
+        col1, col2, col3, col4 = st.columns([1, 1.5, 1, 1])
+        
+        # Check if backtest is running
+        backtest_running = st.session_state.get('backtest_running', False)
+        
         with col2:
-            if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
-                run_backtest(start_date, end_date, universe, initial_capital,
-                           max_position_size, max_active_pairs, entry_z_score,
-                           exit_z_score, stop_loss_z_score, lookback_window,
-                           trading_window, rebalance_frequency, commission_rate)
+            if not backtest_running:
+                if st.button("🚀 Run Backtest", type="primary", use_container_width=True):
+                    st.session_state.backtest_running = True
+                    st.session_state.backtest_stopped = False
+                    run_backtest(start_date, end_date, universe, initial_capital,
+                               max_position_size, max_active_pairs, entry_z_score,
+                               exit_z_score, stop_loss_z_score, lookback_window,
+                               trading_window, rebalance_frequency, commission_rate,
+                               p_value_threshold, min_correlation, min_half_life, 
+                               max_half_life, top_pairs, sector_matching,
+                               force_close_missing_days, max_holding_period)
+            else:
+                st.button("🚀 Running...", disabled=True, use_container_width=True)
+        
+        with col3:
+            if backtest_running:
+                if st.button("⏹️ Stop Backtest", type="secondary", use_container_width=True):
+                    st.session_state.backtest_stopped = True
+                    st.session_state.backtest_running = False
+                    st.warning("⚠️ Backtest stopped by user")
+                    st.rerun()
+            else:
+                if st.button("🔄 Reset to Defaults", use_container_width=True):
+                    reset_to_defaults()
     
     st.markdown("---")
     
@@ -94,15 +226,85 @@ def render_backtesting_page():
         # Show sample results for demonstration
         show_sample_backtest_results()
 
+def reset_to_defaults():
+    """Reset all parameters to their default values."""
+    # Clear all widget keys to force reset
+    keys_to_clear = [
+        'initial_capital', 'max_position_size_slider', 'max_active_pairs',
+        'entry_z_score', 'exit_z_score', 'stop_loss_z_score',
+        'lookback_window', 'trading_window', 'rebalance_frequency', 'commission_rate_input',
+        'p_value_threshold', 'min_correlation', 'min_half_life', 'max_half_life', 
+        'top_pairs', 'sector_matching', 'force_close_missing_days', 'max_holding_period'
+    ]
+    
+    for key in keys_to_clear:
+        if key in st.session_state:
+            del st.session_state[key]
+    
+    # Set a flag to indicate reset was requested
+    st.session_state.reset_requested = True
+    
+    st.success("✅ Parameters reset to defaults!")
+    st.rerun()
+
 def run_backtest(start_date, end_date, universe, initial_capital, max_position_size,
                 max_active_pairs, entry_z_score, exit_z_score, stop_loss_z_score,
-                lookback_window, trading_window, rebalance_frequency, commission_rate):
+                lookback_window, trading_window, rebalance_frequency, commission_rate,
+                p_value_threshold, min_correlation, min_half_life, max_half_life, 
+                top_pairs, sector_matching, force_close_missing_days, max_holding_period):
     """Run the backtest with specified parameters."""
+    
+    # Create progress indicators
+    progress_container = st.container()
+    with progress_container:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        time_estimate = st.empty()
+    
+    # Check if user stopped the backtest
+    if st.session_state.get('backtest_stopped', False):
+        st.session_state.backtest_running = False
+        return
     
     with show_loading_spinner("Running backtest... This may take several minutes."):
         try:
-            # Create backtest engine
-            engine = BacktestEngine(initial_capital=initial_capital)
+            # Create API and backtest engine with same instance
+            from data.api import MarketDataAPI
+            api = MarketDataAPI()
+            engine = BacktestEngine(initial_capital=initial_capital, data_api=api)
+            
+            # Calculate total periods for progress tracking
+            import pandas as pd
+            start_dt = pd.to_datetime(start_date)
+            end_dt = pd.to_datetime(end_date)
+            total_periods = int((end_dt - start_dt).days / rebalance_frequency)
+            
+            def update_progress(current_period, current_date, message=""):
+                # Check if user stopped the backtest
+                if st.session_state.get('backtest_stopped', False):
+                    raise InterruptedError("Backtest stopped by user")
+                
+                if current_period <= total_periods:
+                    progress = current_period / total_periods
+                    progress_bar.progress(progress)
+                    
+                    # Time estimation
+                    if current_period > 0:
+                        elapsed = time.time() - start_time
+                        estimated_total = elapsed / progress
+                        remaining = estimated_total - elapsed
+                        remaining_min = int(remaining / 60)
+                        remaining_sec = int(remaining % 60)
+                        time_estimate.text(f"⏱️ Estimated remaining: {remaining_min}m {remaining_sec}s")
+                    
+                    status_text.text(f"📊 Period {current_period}/{total_periods}: {current_date} - {message}")
+                    
+                    # Force UI update
+                    time.sleep(0.1)
+            
+            # Store update function in engine for callbacks
+            engine.progress_callback = update_progress
+            start_time = time.time()
             
             # Update configuration temporarily
             from config.settings import CONFIG
@@ -111,12 +313,20 @@ def run_backtest(start_date, end_date, universe, initial_capital, max_position_s
             CONFIG['strategy']['lookback_window'] = lookback_window
             CONFIG['strategy']['trading_window'] = trading_window
             CONFIG['strategy']['rebalance_frequency'] = rebalance_frequency
-            CONFIG['strategy']['top_pairs'] = max_active_pairs
+            CONFIG['strategy']['top_pairs'] = top_pairs
+            CONFIG['strategy']['p_value_threshold'] = p_value_threshold
+            CONFIG['strategy']['min_correlation'] = min_correlation
+            CONFIG['strategy']['min_half_life'] = min_half_life
+            CONFIG['strategy']['max_half_life'] = max_half_life
+            CONFIG['strategy']['sector_matching'] = sector_matching
             CONFIG['trading']['entry_z_score'] = entry_z_score
             CONFIG['trading']['exit_z_score'] = exit_z_score
             CONFIG['trading']['stop_loss_z_score'] = stop_loss_z_score
             CONFIG['trading']['max_position_size'] = max_position_size
+            CONFIG['trading']['max_active_pairs'] = max_active_pairs
             CONFIG['trading']['commission_rate'] = commission_rate
+            CONFIG['trading']['force_close_missing_days'] = force_close_missing_days
+            CONFIG['trading']['max_holding_period'] = max_holding_period
             
             # Run backtest
             results = engine.run_rolling_backtest(
@@ -134,8 +344,19 @@ def run_backtest(start_date, end_date, universe, initial_capital, max_position_s
             # Restore original config
             CONFIG.update(original_config)
         
+        except InterruptedError:
+            st.warning("⚠️ Backtest was stopped by user")
+            # Restore original config
+            CONFIG.update(original_config)
+        
         except Exception as e:
             st.error(f"Error running backtest: {e}")
+            # Restore original config
+            CONFIG.update(original_config)
+        
+        finally:
+            # Always reset the running state
+            st.session_state.backtest_running = False
 
 def display_backtest_results():
     """Display comprehensive backtest results."""

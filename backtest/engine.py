@@ -41,6 +41,9 @@ class BacktestEngine:
         self.trades_history = []
         self.pair_history = []
         
+        # Progress callback
+        self.progress_callback = None
+        
     def run_rolling_backtest(self, start_date: str, end_date: str,
                            universe: str = 'IBOV',
                            save_results: bool = True) -> Dict[str, Any]:
@@ -59,6 +62,27 @@ class BacktestEngine:
         logger.info(f"Starting rolling backtest from {start_date} to {end_date}")
         
         try:
+            # Check if requested period overlaps with available data
+            date_range = self.data_api.storage.get_date_range()
+            if date_range.get('min_date') and date_range.get('max_date'):
+                db_start = pd.to_datetime(date_range['min_date'])
+                db_end = pd.to_datetime(date_range['max_date'])
+                request_start = pd.to_datetime(start_date)
+                request_end = pd.to_datetime(end_date)
+                
+                # Adjust dates to fit available data
+                adjusted_start = max(request_start, db_start + timedelta(days=self.lookback_window))
+                adjusted_end = min(request_end, db_end)
+                
+                if adjusted_start >= adjusted_end:
+                    logger.error(f"Requested period {start_date} to {end_date} does not overlap with available data {date_range['min_date']} to {date_range['max_date']}")
+                    return {}
+                
+                if adjusted_start != request_start or adjusted_end != request_end:
+                    logger.info(f"Adjusted backtest period to {adjusted_start.strftime('%Y-%m-%d')} to {adjusted_end.strftime('%Y-%m-%d')} to fit available data")
+                    start_date = adjusted_start.strftime('%Y-%m-%d')
+                    end_date = adjusted_end.strftime('%Y-%m-%d')
+            
             # Convert dates
             start_dt = pd.to_datetime(start_date)
             end_dt = pd.to_datetime(end_date)
@@ -71,9 +95,18 @@ class BacktestEngine:
             # Create date range for backtest
             current_date = start_dt
             portfolio_values = []
+            period_count = 0
+            
+            # Calculate total periods for progress tracking
+            total_periods = int((end_dt - start_dt).days / self.rebalance_frequency) + 1
             
             while current_date <= end_dt:
+                period_count += 1
                 try:
+                    # Update progress
+                    if self.progress_callback:
+                        self.progress_callback(period_count, current_date.strftime('%Y-%m-%d'), "Finding pairs...")
+                    
                     # Formation period: analyze pairs
                     formation_start = current_date - timedelta(days=self.lookback_window)
                     formation_end = current_date
@@ -95,6 +128,8 @@ class BacktestEngine:
                             'top_pairs': pairs[:self.top_pairs]
                         })
                         
+                        logger.info(f"Found {len(pairs)} cointegrated pairs for period ending {current_date.strftime('%Y-%m-%d')}")
+                        
                         # Trading period: generate signals and manage positions
                         trading_end = min(
                             current_date + timedelta(days=self.trading_window),
@@ -108,6 +143,8 @@ class BacktestEngine:
                             trading_end.strftime('%Y-%m-%d')
                         )
                         
+                        logger.info(f"Trading period {current_date.strftime('%Y-%m-%d')} to {trading_end.strftime('%Y-%m-%d')}: executed period")
+                        
                         # Update portfolio value
                         portfolio_value = self.position_manager.get_portfolio_value()
                         portfolio_values.append({
@@ -116,6 +153,8 @@ class BacktestEngine:
                             'cash': self.position_manager.cash,
                             'positions_value': portfolio_value - self.position_manager.cash
                         })
+                    else:
+                        logger.warning(f"No cointegrated pairs found for period ending {current_date.strftime('%Y-%m-%d')}")
                     
                     # Move to next rebalance date
                     current_date += timedelta(days=self.rebalance_frequency)
@@ -170,42 +209,83 @@ class BacktestEngine:
     def _find_pairs_for_period(self, start_date: str, end_date: str, 
                               universe: str) -> List[Dict[str, Any]]:
         """Find cointegrated pairs for a specific period."""
+        logger.info(f"=== _find_pairs_for_period called ===")
+        logger.info(f"Period: {start_date} to {end_date}, Universe: {universe}")
         try:
             from config.universe import get_universe_tickers
             
             # Get universe symbols
             symbols = get_universe_tickers(universe)
             
-            # Get all data at once to avoid individual symbol warnings
-            all_data = self.data_api.get_price_data(symbols, start_date, end_date)
+            # First check which symbols have any data at all
+            available_symbols = self.data_api.get_available_symbols()
+            valid_universe_symbols = [s for s in symbols if s in available_symbols]
             
-            if all_data.empty:
-                logger.debug(f"No data available for period {start_date} to {end_date}")
+            if len(valid_universe_symbols) < 2:
+                logger.debug(f"Insufficient symbols in database for universe {universe}")
                 return []
             
+            # Get all data at once to avoid individual symbol warnings
+            logger.info(f"Step 1: Requesting data for {len(valid_universe_symbols)} symbols from {start_date} to {end_date}")
+            try:
+                all_data = self.data_api.get_price_data(valid_universe_symbols, start_date, end_date)
+            except Exception as e:
+                logger.error(f"ERROR in get_price_data: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                return []
+            
+            if all_data.empty:
+                # Check overall date range in database
+                date_range = self.data_api.storage.get_date_range()
+                logger.warning(f"No data available for period {start_date} to {end_date}. Database has data from {date_range.get('min_date')} to {date_range.get('max_date')}")
+                return []
+            
+            logger.info(f"Step 2: Retrieved data: {all_data.shape[0]} rows, {all_data.shape[1]} symbols")
+            
             # Filter symbols with sufficient data
+            # Use flexible minimum based on what's available
+            actual_period_length = len(all_data)
+            min_points = max(100, int(actual_period_length * 0.7))  # At least 100 points, or 70% of available
+            logger.info(f"Step 3: Filtering symbols with sufficient data (min {min_points} points, period has {actual_period_length} days)")
+            
             valid_symbols = []
-            min_points = int(self.lookback_window * 0.8)  # 80% data availability
             
             for symbol in all_data.columns:
                 symbol_data = all_data[symbol].dropna()
                 if len(symbol_data) >= min_points:
                     valid_symbols.append(symbol)
+                else:
+                    logger.debug(f"Symbol {symbol} has {len(symbol_data)} points, needs {min_points}")
             
             if len(valid_symbols) < 2:
-                logger.debug(f"Insufficient valid symbols for period {start_date} to {end_date}: {len(valid_symbols)}")
+                logger.warning(f"Step 4: Insufficient valid symbols for period {start_date} to {end_date}: {len(valid_symbols)}")
                 return []
             
-            logger.debug(f"Found {len(valid_symbols)} valid symbols for period")
+            logger.info(f"Step 4: Found {len(valid_symbols)} valid symbols for period")
+            logger.info(f"Step 4: Valid symbols: {valid_symbols[:10]}...")  # Show first 10 symbols
             
             # Find cointegrated pairs
-            pairs = self.pair_selector.find_cointegrated_pairs(
-                valid_symbols, start_date, end_date, max_workers=2
-            )
+            logger.info(f"BEFORE: Calling find_cointegrated_pairs with {len(valid_symbols)} symbols")
+            try:
+                pairs = self.pair_selector.find_cointegrated_pairs(
+                    valid_symbols, start_date, end_date, max_workers=1
+                )
+                logger.info(f"AFTER: find_cointegrated_pairs returned {len(pairs) if pairs else 0} pairs")
+            except Exception as e:
+                logger.error(f"ERROR in find_cointegrated_pairs: {e}")
+                import traceback
+                logger.error(f"Traceback: {traceback.format_exc()}")
+                pairs = []
             
+            logger.info(f"BEFORE: filter_by_criteria with {len(pairs) if pairs else 0} pairs")
             # Filter and rank pairs
             filtered_pairs = self.pair_selector.filter_by_criteria(pairs)
+            logger.info(f"AFTER: filter_by_criteria returned {len(filtered_pairs) if filtered_pairs else 0} pairs")
+            
+            logger.info(f"BEFORE: rank_pairs")
             ranked_pairs = self.pair_selector.rank_pairs(filtered_pairs)
+            logger.info(f"AFTER: rank_pairs returned {len(ranked_pairs) if ranked_pairs else 0} pairs")
             
             return ranked_pairs
             
@@ -229,6 +309,35 @@ class BacktestEngine:
                 try:
                     date_str = date.strftime('%Y-%m-%d')
                     
+                    # Check for force-close conditions first
+                    positions_to_close = self.position_manager.check_force_close_conditions(date_str)
+                    if positions_to_close:
+                        # Get current prices for force-close
+                        symbols_for_prices = set()
+                        for pair_id, _ in positions_to_close:
+                            if pair_id in self.position_manager.positions:
+                                pos = self.position_manager.positions[pair_id]
+                                symbols_for_prices.add(pos.symbol1)
+                                symbols_for_prices.add(pos.symbol2)
+                        
+                        if symbols_for_prices:
+                            try:
+                                price_data = self.data_api.get_price_data(list(symbols_for_prices), date_str, date_str)
+                                current_prices = {}
+                                if not price_data.empty:
+                                    for symbol in symbols_for_prices:
+                                        if symbol in price_data.columns:
+                                            current_prices[symbol] = price_data[symbol].iloc[-1]
+                                
+                                # Force close positions
+                                force_closed_trades = self.position_manager.force_close_positions(
+                                    positions_to_close, current_prices, date_str
+                                )
+                                period_trades.extend(force_closed_trades)
+                                self.trades_history.extend(force_closed_trades)
+                            except Exception as e:
+                                logger.error(f"Error in force-close: {e}")
+                    
                     # Generate signals for all pairs
                     for pair in pairs:
                         symbol1 = pair['symbol1']
@@ -241,21 +350,31 @@ class BacktestEngine:
                         current_position = self.position_manager.get_position(pair_id)
                         position_side = current_position.get('side', PositionSide.FLAT)
                         
-                        # Calculate current spread and z-score
+                        # Calculate current spread and z-score with reduced lookback
+                        lookback_days = 15  # Reduced from 30 to 15 days
                         spread = self.signal_generator.calculate_spread(
                             symbol1, symbol2, hedge_ratio, intercept,
-                            (date - timedelta(days=30)).strftime('%Y-%m-%d'),
+                            (date - timedelta(days=lookback_days)).strftime('%Y-%m-%d'),
                             date_str
                         )
                         
+                        # Update position monitoring status
+                        if pair_id in self.position_manager.positions:
+                            position = self.position_manager.positions[pair_id]
+                            position.update_monitoring_status(date_str, not spread.empty)
+                        
                         if spread.empty:
+                            logger.debug(f"Skipping {pair_id} on {date_str}: insufficient spread data (need {lookback_days} days)")
                             continue
                         
                         # Calculate z-score
                         z_score = self.signal_generator.calculate_z_score(spread)
                         
                         if z_score.empty:
+                            logger.debug(f"Skipping {pair_id} on {date_str}: z-score calculation failed")
                             continue
+                        
+                        current_z_score = z_score.iloc[-1]
                         
                         current_z_score = z_score.iloc[-1]
                         
@@ -265,6 +384,7 @@ class BacktestEngine:
                         )
                         
                         if signals.empty:
+                            logger.debug(f"Skipping {pair_id} on {date_str}: no signals generated (z-score: {current_z_score:.2f})")
                             continue
                         
                         current_signal = signals.iloc[-1]
@@ -278,10 +398,41 @@ class BacktestEngine:
                         if trade_result:
                             period_trades.append(trade_result)
                             self.trades_history.append(trade_result)
+                            logger.info(f"Executed trade for {pair_id}: {trade_result.get('action', 'UNKNOWN')} signal on {date_str}")
+                        else:
+                            logger.debug(f"Trade execution failed for {pair_id} on {date_str}: signal={current_signal}, z-score={current_z_score:.2f}")
                 
                 except Exception as e:
                     logger.error(f"Error processing trading date {date}: {e}")
                     continue
+            
+            # End-of-period cleanup: close any remaining positions
+            if len(trading_dates) > 0 and len(self.position_manager.positions) > 0:
+                end_date = trading_dates[-1].strftime('%Y-%m-%d')
+                logger.info(f"End of trading period: closing {len(self.position_manager.positions)} remaining positions")
+                
+                # Get symbols for final price lookup
+                symbols_for_cleanup = set()
+                for position in self.position_manager.positions.values():
+                    symbols_for_cleanup.add(position.symbol1)
+                    symbols_for_cleanup.add(position.symbol2)
+                
+                if symbols_for_cleanup:
+                    try:
+                        final_prices_data = self.data_api.get_price_data(list(symbols_for_cleanup), end_date, end_date)
+                        final_prices = {}
+                        if not final_prices_data.empty:
+                            for symbol in symbols_for_cleanup:
+                                if symbol in final_prices_data.columns:
+                                    final_prices[symbol] = final_prices_data[symbol].iloc[-1]
+                        
+                        # Close all remaining positions
+                        cleanup_trades = self.position_manager.close_all_positions(final_prices, end_date, 'PERIOD_END')
+                        period_trades.extend(cleanup_trades)
+                        self.trades_history.extend(cleanup_trades)
+                        logger.info(f"Closed {len(cleanup_trades)} positions at period end")
+                    except Exception as e:
+                        logger.error(f"Error in end-of-period cleanup: {e}")
             
             return {'trades': period_trades}
             

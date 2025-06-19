@@ -187,7 +187,7 @@ def create_drawdown_chart(equity_curve, title="Drawdown Analysis"):
     fig.add_trace(go.Scatter(
         x=drawdown.index,
         y=drawdown.values,
-        fill='tonegative',
+        fill='tozeroy',
         mode='lines',
         name='Drawdown %',
         line=dict(color='red', width=1),

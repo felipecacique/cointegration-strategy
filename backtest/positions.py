@@ -42,6 +42,8 @@ class Position:
         self.exit_price2 = None
         self.pnl = 0.0
         self.commission_paid = 0.0
+        self.missing_data_days = 0  # Track consecutive days without data
+        self.last_monitoring_date = pd.to_datetime(entry_date)  # Track last successful monitoring
         
     def calculate_current_value(self, current_price1: float, current_price2: float) -> float:
         """Calculate current position value."""
@@ -110,6 +112,24 @@ class Position:
         except Exception as e:
             logger.error(f"Error closing position {self.pair_id}: {e}")
             return {}
+    
+    def should_force_close_missing_data(self, max_missing_days: int) -> bool:
+        """Check if position should be force-closed due to missing data."""
+        return self.missing_data_days >= max_missing_days
+    
+    def should_force_close_timeout(self, current_date: str, max_holding_days: int) -> bool:
+        """Check if position should be force-closed due to timeout."""
+        current_dt = pd.to_datetime(current_date)
+        holding_days = (current_dt - self.entry_date).days
+        return holding_days >= max_holding_days
+    
+    def update_monitoring_status(self, current_date: str, has_data: bool):
+        """Update position monitoring status."""
+        if has_data:
+            self.missing_data_days = 0  # Reset counter
+            self.last_monitoring_date = pd.to_datetime(current_date)
+        else:
+            self.missing_data_days += 1
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert position to dictionary."""
@@ -394,6 +414,48 @@ class PositionManager:
                 positions_to_update.append(pair_id)
         
         return positions_to_update
+    
+    def check_force_close_conditions(self, current_date: str) -> List[str]:
+        """Check which positions should be force-closed."""
+        from config.settings import CONFIG
+        
+        positions_to_close = []
+        max_missing_days = CONFIG['trading'].get('force_close_missing_days', 14)
+        max_holding_days = CONFIG['trading'].get('max_holding_period', 90)
+        
+        for pair_id, position in self.positions.items():
+            # Check missing data condition
+            if position.should_force_close_missing_data(max_missing_days):
+                positions_to_close.append((pair_id, 'MISSING_DATA'))
+                logger.warning(f"Force closing {pair_id}: {position.missing_data_days} consecutive days without data")
+            
+            # Check timeout condition
+            elif position.should_force_close_timeout(current_date, max_holding_days):
+                positions_to_close.append((pair_id, 'TIMEOUT'))
+                holding_days = (pd.to_datetime(current_date) - position.entry_date).days
+                logger.warning(f"Force closing {pair_id}: {holding_days} days holding period exceeded")
+        
+        return positions_to_close
+    
+    def force_close_positions(self, positions_to_close: List[Tuple[str, str]], 
+                            current_prices: Dict[str, float], date: str) -> List[Dict[str, Any]]:
+        """Force close specific positions."""
+        closed_trades = []
+        
+        for pair_id, reason in positions_to_close:
+            if pair_id in self.positions:
+                position = self.positions[pair_id]
+                
+                # Get current prices or use last known prices
+                price1 = current_prices.get(position.symbol1, position.entry_price1)
+                price2 = current_prices.get(position.symbol2, position.entry_price2)
+                
+                trade_result = self.close_position(pair_id, price1, price2, date, reason)
+                if trade_result:
+                    closed_trades.append(trade_result)
+                    logger.info(f"Force closed position {pair_id} due to {reason}")
+        
+        return closed_trades
     
     def close_all_positions(self, current_prices: Dict[str, float], 
                            date: str, reason: str = 'FORCE_CLOSE') -> List[Dict[str, Any]]:

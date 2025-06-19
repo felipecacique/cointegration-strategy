@@ -273,6 +273,19 @@ class DataStorageManager:
                       end_date: str = None) -> pd.DataFrame:
         """Retrieve price data for a symbol."""
         try:
+            # Temporarily disable overlap checking for debugging
+            # if start_date and end_date:
+            #     date_range = self.get_date_range(symbol)
+            #     symbol_start = pd.to_datetime(date_range.get('min_date'))
+            #     symbol_end = pd.to_datetime(date_range.get('max_date'))
+            #     request_start = pd.to_datetime(start_date)
+            #     request_end = pd.to_datetime(end_date)
+            #     
+            #     if (symbol_start is None or symbol_end is None or 
+            #         request_end < symbol_start or request_start > symbol_end):
+            #         logger.debug(f"No overlap for {symbol}: requested {start_date} to {end_date}, available {date_range.get('min_date')} to {date_range.get('max_date')}")
+            #         return pd.DataFrame()
+            
             query = """
                 SELECT date, open, high, low, close, volume, adj_close
                 FROM daily_prices 
@@ -313,12 +326,12 @@ class DataStorageManager:
     def get_date_range(self, symbol: str = None) -> Dict[str, str]:
         """Get date range of available data."""
         try:
-            query = "SELECT MIN(date) as min_date, MAX(date) as max_date FROM daily_prices"
-            params = []
-            
             if symbol:
-                query += " WHERE symbol = ?"
-                params.append(symbol)
+                query = "SELECT MIN(date) as min_date, MAX(date) as max_date FROM daily_prices WHERE symbol = :symbol"
+                params = {'symbol': symbol}
+            else:
+                query = "SELECT MIN(date) as min_date, MAX(date) as max_date FROM daily_prices"
+                params = {}
             
             df = pd.read_sql_query(query, self.engine, params=params)
             

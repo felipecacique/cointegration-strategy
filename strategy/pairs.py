@@ -43,54 +43,109 @@ class PairSelector:
         Returns:
             List of dictionaries with pair test results
         """
-        if min_pvalue is None:
-            min_pvalue = self.config['p_value_threshold']
-        
-        logger.info(f"Testing {len(symbols)} symbols for cointegration")
-        
-        # Generate all possible pairs
-        pair_combinations = list(combinations(symbols, 2))
-        logger.info(f"Testing {len(pair_combinations)} pair combinations")
-        
-        results = []
-        completed_count = 0
-        total_pairs = len(pair_combinations)
-        
-        # Test pairs in parallel
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            # Submit all pair tests
-            future_to_pair = {
-                executor.submit(
-                    self._test_single_pair, 
-                    pair[0], pair[1], 
-                    start_date, end_date
-                ): pair
-                for pair in pair_combinations
-            }
+        try:
+            if min_pvalue is None:
+                min_pvalue = self.config['p_value_threshold']
             
-            # Collect results
-            for future in as_completed(future_to_pair):
-                pair = future_to_pair[future]
-                completed_count += 1
-                
+            logger.info(f"=== STARTING COINTEGRATION ANALYSIS ===")
+            logger.info(f"Testing {len(symbols)} symbols for cointegration")
+            logger.info(f"Date range: {start_date} to {end_date}")
+            logger.info(f"Max workers: {max_workers}")
+            logger.info(f"P-value threshold: {min_pvalue}")
+            
+            # Generate all possible pairs
+            pair_combinations = list(combinations(symbols, 2))
+            logger.info(f"Testing {len(pair_combinations)} pair combinations")
+        
+            # Test dependencies first
+            try:
+                import statsmodels.api as sm
+                from statsmodels.tsa.stattools import coint, adfuller
+                logger.info(f"DEBUG: Dependencies OK - statsmodels imported successfully")
+            except Exception as e:
+                logger.error(f"DEBUG: Dependency error - {e}")
+                return []
+        
+            # Test first pair manually for debugging
+            if len(pair_combinations) > 0:
+                test_pair = pair_combinations[0]
+                logger.info(f"DEBUG: Will test sample pair {test_pair[0]} - {test_pair[1]}")
                 try:
-                    result = future.result()
+                    # Test it immediately 
+                    test_result = self._test_single_pair(test_pair[0], test_pair[1], start_date, end_date)
+                    logger.info(f"DEBUG: Sample pair result: {test_result}")
+                except Exception as e:
+                    logger.error(f"DEBUG: Error testing sample pair: {e}")
+                    import traceback
+                    logger.error(f"DEBUG: Traceback: {traceback.format_exc()}")
+            
+            results = []
+            completed_count = 0
+            total_pairs = len(pair_combinations)
+        
+            # Test first 10 pairs sequentially for debugging
+            logger.info(f"Testing first 10 pairs sequentially for debugging...")
+            for i, pair in enumerate(pair_combinations[:10]):
+                logger.info(f"Testing pair {i+1}/10: {pair[0]} - {pair[1]}")
+                try:
+                    result = self._test_single_pair(pair[0], pair[1], start_date, end_date)
                     if result and result.get('is_cointegrated', False):
                         if result.get('coint_pvalue', 1.0) <= min_pvalue:
                             results.append(result)
-                            logger.debug(f"Found cointegrated pair: {pair[0]}-{pair[1]} "
-                                       f"(p={result['coint_pvalue']:.4f})")
-                
+                            logger.info(f"*** FOUND COINTEGRATED PAIR: {pair[0]}-{pair[1]} ***")
+                    else:
+                        logger.info(f"Pair {pair[0]}-{pair[1]} not cointegrated")
                 except Exception as e:
                     logger.error(f"Error testing pair {pair}: {e}")
-                
-                # Update progress if callback provided
-                if progress_callback and completed_count % 50 == 0:  # Update every 50 pairs
-                    progress_pct = completed_count / total_pairs
-                    progress_callback(progress_pct, f"Tested {completed_count}/{total_pairs} pairs, found {len(results)} cointegrated")
+                    import traceback
+                    logger.error(f"Traceback: {traceback.format_exc()}")
+            
+            # If we want to test all pairs, use parallel processing
+            if len(results) == 0 and len(pair_combinations) > 10:
+                logger.info(f"No cointegrated pairs in first 10, testing all {len(pair_combinations)} pairs...")
+                # Test pairs in parallel
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    # Submit all pair tests
+                    future_to_pair = {
+                        executor.submit(
+                            self._test_single_pair, 
+                            pair[0], pair[1], 
+                            start_date, end_date
+                        ): pair
+                        for pair in pair_combinations[10:]  # Skip first 10 already tested
+                    }
+                    
+                    # Collect results
+                    for future in as_completed(future_to_pair):
+                        pair = future_to_pair[future]
+                        completed_count += 1
+                        
+                        try:
+                            result = future.result()
+                            if result and result.get('is_cointegrated', False):
+                                if result.get('coint_pvalue', 1.0) <= min_pvalue:
+                                    results.append(result)
+                                    logger.debug(f"Found cointegrated pair: {pair[0]}-{pair[1]} "
+                                               f"(p={result['coint_pvalue']:.4f})")
+                        
+                        except Exception as e:
+                            logger.error(f"Error testing pair {pair}: {e}")
+                        
+                        # Update progress if callback provided
+                        if progress_callback and completed_count % 50 == 0:  # Update every 50 pairs
+                            progress_pct = completed_count / total_pairs
+                            progress_callback(progress_pct, f"Tested {completed_count}/{total_pairs} pairs, found {len(results)} cointegrated")
+            
+            logger.info(f"Found {len(results)} cointegrated pairs out of {len(pair_combinations)} tested")
+            if len(results) == 0:
+                logger.warning(f"No cointegrated pairs found with p-value <= {min_pvalue}. Consider increasing threshold.")
+            return results
         
-        logger.info(f"Found {len(results)} cointegrated pairs")
-        return results
+        except Exception as e:
+            logger.error(f"CRITICAL ERROR in find_cointegrated_pairs: {e}")
+            import traceback
+            logger.error(f"Traceback: {traceback.format_exc()}")
+            return []
     
     def _test_single_pair(self, symbol1: str, symbol2: str,
                          start_date: str = None, end_date: str = None) -> Dict[str, Any]:
@@ -99,7 +154,12 @@ class PairSelector:
             # Get pair data
             data = self.data_api.get_pairs_data(symbol1, symbol2, start_date, end_date)
             
-            if data.empty or len(data) < 30:
+            if data.empty:
+                logger.debug(f"No data for pair {symbol1}-{symbol2}")
+                return None
+                
+            if len(data) < 50:
+                logger.debug(f"Insufficient data for pair {symbol1}-{symbol2}: {len(data)} points")
                 return None
             
             # Extract price series
@@ -108,6 +168,14 @@ class PairSelector:
             
             # Test cointegration
             result = self.coint_tester.test_pair_cointegration(y1, y2)
+            
+            # Debug first successful test
+            if result and result.get('is_cointegrated', False):
+                logger.info(f"DEBUG: Found cointegrated pair {symbol1}-{symbol2}: {result}")
+            
+            if not result:
+                logger.debug(f"Cointegration test failed for {symbol1}-{symbol2}")
+                return None
             
             # Add pair information
             result.update({
@@ -236,38 +304,59 @@ class PairSelector:
         min_correlation = min_correlation or self.config.get('min_correlation', 0.7)
         same_sector_only = same_sector_only or self.config.get('sector_matching', False)
         
+        # Calculate minimum data points for this analysis
+        min_data_points = max(50, int(self.config.get('lookback_window', 252) * 0.7))
+        
         logger.info(f"Filtering {len(pairs)} pairs with criteria: "
                    f"half_life: {min_half_life}-{max_half_life}, "
                    f"min_correlation: {min_correlation}, "
-                   f"same_sector_only: {same_sector_only}")
+                   f"same_sector_only: {same_sector_only}, "
+                   f"min_data_points: {min_data_points}")
         
         filtered_pairs = []
         
+        rejected_reasons = {'half_life': 0, 'correlation': 0, 'sector': 0, 'data_points': 0, 'p_value': 0}
+        
         for pair in pairs:
+            pair_id = f"{pair.get('symbol1', 'UNK')}-{pair.get('symbol2', 'UNK')}"
+            
             # Half-life filter
             half_life = pair.get('half_life', 0)
             if not (min_half_life <= half_life <= max_half_life):
+                rejected_reasons['half_life'] += 1
                 continue
             
             # Correlation filter
             correlation = pair.get('correlation', 0)
             if abs(correlation) < min_correlation:
+                rejected_reasons['correlation'] += 1
                 continue
             
             # Sector filter
             if same_sector_only and not pair.get('same_sector', False):
+                rejected_reasons['sector'] += 1
                 continue
             
-            # Additional quality filters
-            if pair.get('data_points', 0) < 252:  # At least 1 year of data
+            # Additional quality filters - use calculated min_data_points
+            data_points = pair.get('data_points', 0)
+            if data_points < min_data_points:
+                rejected_reasons['data_points'] += 1
+                logger.debug(f"Pair {pair_id} rejected: data_points={data_points} < {min_data_points}")
                 continue
             
-            if pair.get('coint_pvalue', 1.0) > self.config['p_value_threshold']:
+            p_value = pair.get('coint_pvalue', 1.0)
+            if p_value > self.config['p_value_threshold']:
+                rejected_reasons['p_value'] += 1
                 continue
             
             filtered_pairs.append(pair)
         
         logger.info(f"After filtering: {len(filtered_pairs)} pairs remain")
+        if rejected_reasons['data_points'] > 0 or rejected_reasons['half_life'] > 0:
+            logger.info(f"Rejection summary: half_life={rejected_reasons['half_life']}, "
+                       f"correlation={rejected_reasons['correlation']}, "
+                       f"data_points={rejected_reasons['data_points']}, "
+                       f"p_value={rejected_reasons['p_value']}")
         return filtered_pairs
     
     def select_top_pairs(self, pairs: List[Dict[str, Any]],

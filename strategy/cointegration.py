@@ -35,13 +35,13 @@ class CointegrationTester:
             if len(y1) != len(y2):
                 raise ValueError("Series must have same length")
             
-            if len(y1) < 30:
+            if len(y1) < 50:  # Reduced from 30, but let's be more reasonable
                 raise ValueError("Insufficient data points for cointegration test")
             
             # Align series and remove NaN values
             data = pd.DataFrame({'y1': y1, 'y2': y2}).dropna()
             
-            if len(data) < 30:
+            if len(data) < 50:
                 raise ValueError("Insufficient valid data points after cleaning")
             
             y1_clean = data['y1']
@@ -67,13 +67,27 @@ class CointegrationTester:
             # Step 6: Calculate correlation
             correlation = y1_clean.corr(y2_clean)
             
-            # Determine if pair is cointegrated
-            is_cointegrated = (
-                coint_test[1] < self.confidence_level and  # Cointegration test p-value
-                adf_residuals[1] < self.confidence_level and  # Residuals stationarity
-                half_life > 0 and half_life < 60 and  # Reasonable mean reversion speed
-                abs(correlation) > 0.3  # Minimum correlation
-            )
+            # Determine if pair is cointegrated (sensible default criteria)
+            coint_pass = coint_test[1] < 0.05  # Standard 5% significance level
+            adf_pass = adf_residuals[1] < 0.05  # Standard 5% significance level
+            half_life_pass = not np.isnan(half_life) and (5 <= half_life <= 30)  # Reasonable half-life range
+            corr_pass = abs(correlation) > 0.7  # Strong correlation required
+            
+            is_cointegrated = coint_pass and adf_pass and half_life_pass and corr_pass
+            
+            # Debug logging - static counter for first few tests
+            if not hasattr(self, '_test_count'):
+                self._test_count = 0
+            self._test_count += 1
+            
+            if self._test_count <= 3:  # Log first 3 tests
+                logger.info(f"DEBUG Cointegration #{self._test_count}: coint_p={coint_test[1]:.4f}(<0.05={coint_pass}), "
+                           f"adf_p={adf_residuals[1]:.4f}(<0.05={adf_pass}), "
+                           f"half_life={half_life}(5-30={half_life_pass}), "
+                           f"corr={correlation:.3f}(>0.7={corr_pass}), "
+                           f"cointegrated={is_cointegrated})")
+                if np.isnan(half_life):
+                    logger.info(f"DEBUG Half-life NaN for test #{self._test_count}: spread_len={len(spread)}, spread_std={spread.std():.4f}")
             
             results = {
                 'is_cointegrated': is_cointegrated,
@@ -142,55 +156,72 @@ class CointegrationTester:
             Half-life in days (periods)
         """
         try:
-            if len(spread) < 20:  # Need minimum data
+            if len(spread) < 30:  # Need minimum data for reliable estimate
                 return np.nan
             
-            # Remove any infinite or NaN values
+            # Remove any infinite or NaN values and ensure we have a clean series
             spread_clean = spread.dropna()
-            if len(spread_clean) < 20:
+            if len(spread_clean) < 30:
                 return np.nan
             
-            # Calculate first differences more robustly
-            spread_lag = spread_clean.shift(1).dropna()
-            spread_diff = spread_clean.diff().dropna()
+            # Reset index to ensure proper alignment
+            spread_clean = spread_clean.reset_index(drop=True)
             
-            # Ensure we have the same indices
-            common_index = spread_lag.index.intersection(spread_diff.index)
-            if len(common_index) < 10:
+            # Calculate lagged spread and differences
+            spread_lag = spread_clean[:-1].values  # t-1
+            spread_diff = spread_clean[1:].values - spread_clean[:-1].values  # Δspread(t)
+            
+            # Ensure we have enough data points
+            if len(spread_lag) < 10:
                 return np.nan
-                
-            spread_lag = spread_lag[common_index]
-            spread_diff = spread_diff[common_index]
             
             # Additional data quality checks
-            if spread_lag.std() == 0 or spread_diff.std() == 0:
+            if np.std(spread_lag) == 0 or np.std(spread_diff) == 0:
+                return np.nan
+            
+            # Check for extreme values that might cause numerical issues
+            if np.any(np.abs(spread_lag) > 1e6) or np.any(np.abs(spread_diff) > 1e6):
                 return np.nan
             
             try:
                 # Fit AR(1) model: Δspread(t) = α + β*spread(t-1) + ε(t)
-                X = sm.add_constant(spread_lag)
+                X = np.column_stack([np.ones(len(spread_lag)), spread_lag])  # [1, spread_lag]
                 y = spread_diff
                 
-                # Check for multicollinearity or other issues
-                if np.linalg.cond(X.T @ X) > 1e12:
+                # Check for multicollinearity or singular matrix
+                try:
+                    XtX = X.T @ X
+                    condition_number = np.linalg.cond(XtX)
+                    if condition_number > 1e10:
+                        return np.nan
+                except:
                     return np.nan
                 
-                model = OLS(y, X).fit()
-                
-                if len(model.params) < 2 or not model.converged:
+                # Use numpy's least squares for more robust fitting
+                try:
+                    coeffs, residuals, rank, s = np.linalg.lstsq(X, y, rcond=None)
+                    if rank < 2:  # Matrix is not full rank
+                        return np.nan
+                except:
                     return np.nan
-                    
-                beta = float(model.params[1])  # Coefficient of lagged spread
                 
-                # Robust checks for beta
+                if len(coeffs) < 2:
+                    return np.nan
+                
+                beta = float(coeffs[1])  # Coefficient of lagged spread
+                
+                # Robust checks for beta - for mean reversion, beta should be negative
                 if not np.isfinite(beta) or beta >= 0 or beta <= -2:
                     return np.nan
                 
-                # Calculate half-life with additional safety
+                # Calculate half-life using the formula: half_life = -ln(2) / ln(1 + β)
+                # For AR(1): spread(t) = α + β*spread(t-1) + ε(t)
+                # Mean reversion parameter is λ = -β
                 lambda_val = -beta
-                if lambda_val <= 0:
+                if lambda_val <= 0 or lambda_val >= 1:
                     return np.nan
-                    
+                
+                # Half-life = ln(2) / λ
                 half_life = np.log(2) / lambda_val
                 
                 # Final sanity checks

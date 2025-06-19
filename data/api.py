@@ -35,9 +35,23 @@ class MarketDataAPI:
                     # Use adjusted close if requested
                     price_col = 'adj_close' if adjust_prices and 'adj_close' in df.columns else 'close'
                     data_dict[symbol] = df[price_col]
+                else:
+                    # Debug: check if symbol has any data
+                    if start_date or end_date:
+                        all_data = self.storage.get_price_data(symbol)
+                        if not all_data.empty:
+                            date_range = self.storage.get_date_range(symbol)
+                            logger.debug(f"Symbol {symbol} has data from {date_range.get('min_date')} to {date_range.get('max_date')}, but none in period {start_date} to {end_date}")
+                        else:
+                            logger.debug(f"Symbol {symbol} has no data at all in database")
             
             if not data_dict:
-                logger.warning(f"No data found for symbols: {symbols}")
+                # Check if this is a backtest/bulk analysis context
+                missing_symbols = [s for s in symbols if s not in data_dict]
+                if len(missing_symbols) <= 5:  # Only log if few symbols missing
+                    logger.debug(f"No data found for symbols: {missing_symbols}")
+                else:
+                    logger.warning(f"No data found for {len(missing_symbols)} symbols")
                 return pd.DataFrame()
             
             # Combine into single DataFrame

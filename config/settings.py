@@ -15,24 +15,26 @@ CONFIG = {
         'timezone': 'America/Sao_Paulo',
     },
     'strategy': {
-        'lookback_window': 252,
-        'trading_window': 63,
-        'rebalance_frequency': 21,
-        'top_pairs': 15,
-        'min_half_life': 5,
-        'max_half_life': 30,
-        'min_correlation': 0.7,
-        'p_value_threshold': 0.05,
-        'sector_matching': False,
+        'lookback_window': 252,  # 1 year (Gatev et al. 2006 standard)
+        'trading_window': 63,  # 3 months (academic standard)
+        'rebalance_frequency': 63,  # Quarterly rebalancing (academic standard)
+        'top_pairs': 20,  # Academic studies typically use 15-20 pairs
+        'min_half_life': 5,  # Minimum mean reversion speed (academic range: 5-30)
+        'max_half_life': 30,  # Maximum mean reversion speed
+        'min_correlation': 0.7,  # Strong correlation requirement (academic: 0.6-0.8)
+        'p_value_threshold': 0.05,  # 95% confidence for cointegration (statistical standard)
+        'sector_matching': False,  # Cross-sector pairs allowed (diversification)
     },
     'trading': {
-        'entry_z_score': 2.0,
-        'exit_z_score': 0.5,
-        'stop_loss_z_score': 3.0,
-        'max_position_size': 0.1,
-        'initial_capital': 100000,
-        'commission_rate': 0.003,
-        'max_active_pairs': 10,
+        'entry_z_score': 1.5,  # Reduced from 2.0 for better signal generation
+        'exit_z_score': 0.5,  # Exit before mean (conservative approach)
+        'stop_loss_z_score': 3.0,  # Risk management (3 std devs)
+        'max_position_size': 0.05,  # 5% per pair (conservative, academic standard)
+        'initial_capital': 100000,  # R$ 100k baseline
+        'commission_rate': 0.0025,  # 0.25% - realistic for Brazilian market
+        'max_active_pairs': 20,  # Match with top_pairs for full utilization
+        'force_close_missing_days': 14,  # Force close after X consecutive days without data
+        'max_holding_period': 90,  # Maximum days to hold any position (timeout)
     },
     'risk': {
         'max_drawdown': 0.15,
