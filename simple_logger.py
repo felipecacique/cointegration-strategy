@@ -29,7 +29,7 @@ def get_logger(name='pairs_trading'):
             if not os.path.exists('logs'):
                 os.makedirs('logs')
             
-            file_handler = logging.FileHandler('logs/pairs_trading.log')
+            file_handler = logging.FileHandler('logs/pairs_trading.log', encoding='utf-8')
             file_handler.setFormatter(formatter)
             logger.addHandler(file_handler)
         except:

@@ -101,8 +101,15 @@ class TradingSignalGenerator:
             Spread series: symbol1 - hedge_ratio * symbol2 - intercept
         """
         try:
+            # Set trading context flag for flexible data requirements
+            self.data_api._trading_context = True
+            
             # Get pair data
             data = self.data_api.get_pairs_data(symbol1, symbol2, start_date, end_date)
+            
+            # Clear trading context flag
+            if hasattr(self.data_api, '_trading_context'):
+                delattr(self.data_api, '_trading_context')
             
             if data.empty:
                 return pd.Series(dtype=float)
@@ -136,13 +143,27 @@ class TradingSignalGenerator:
             Series of signals
         """
         try:
+            # Debug signal generation
+            if not hasattr(self, '_debug_signal_count'):
+                self._debug_signal_count = 0
+            self._debug_signal_count += 1
+            
+            if self._debug_signal_count <= 2:
+                logger.info(f"DEBUG SIGNALS #{self._debug_signal_count}: Generating signals for z_score len={len(z_score)}, current_pos={current_position}")
+            
             if z_score.empty:
+                if self._debug_signal_count <= 2:
+                    logger.info(f"DEBUG: Empty z_score series, returning empty signals")
                 return pd.Series(dtype=object)
             
             # Use config defaults if not specified
             entry_threshold = entry_threshold or self.config.get('entry_z_score', 2.0)
             exit_threshold = exit_threshold or self.config.get('exit_z_score', 0.5)
             stop_loss_threshold = stop_loss_threshold or self.config.get('stop_loss_z_score', 3.0)
+            
+            if self._debug_signal_count <= 2:
+                logger.info(f"DEBUG: Thresholds - entry: ±{entry_threshold}, exit: ±{exit_threshold}, stop: ±{stop_loss_threshold}")
+                logger.info(f"DEBUG: Current z_score: {z_score.iloc[-1]:.2f}")
             
             signals = pd.Series(SignalType.NO_SIGNAL, index=z_score.index)
             

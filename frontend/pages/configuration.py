@@ -177,6 +177,41 @@ def render_strategy_config():
             help="Z-score threshold for stop-loss"
         )
     
+    # Additional trading parameters
+    st.markdown("**🔧 Execution Parameters**")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        execution_price_lookback_days = st.number_input(
+            "Price Execution Lookback (days)",
+            min_value=1,
+            max_value=30,
+            value=CONFIG['trading'].get('execution_price_lookback_days', 7),
+            step=1,
+            help="Days to look back for price data during trade execution"
+        )
+    
+    with col2:
+        max_position_size = st.number_input(
+            "Max Position Size (%)",
+            min_value=1.0,
+            max_value=20.0,
+            value=CONFIG['trading'].get('max_position_size', 0.05) * 100,
+            step=0.5,
+            help="Maximum position size as percentage of portfolio"
+        )
+    
+    with col3:
+        commission_rate = st.number_input(
+            "Commission Rate (%)",
+            min_value=0.0,
+            max_value=2.0,
+            value=CONFIG['trading'].get('commission_rate', 0.0025) * 100,
+            step=0.01,
+            help="Trading commission as percentage"
+        )
+    
     # Store updated values in session state
     if 'config_updates' not in st.session_state:
         st.session_state.config_updates = {}
@@ -196,7 +231,10 @@ def render_strategy_config():
         'trading': {
             'entry_z_score': entry_z_score,
             'exit_z_score': exit_z_score,
-            'stop_loss_z_score': stop_loss_z_score
+            'stop_loss_z_score': stop_loss_z_score,
+            'execution_price_lookback_days': execution_price_lookback_days,
+            'max_position_size': max_position_size / 100,  # Convert back to decimal
+            'commission_rate': commission_rate / 100  # Convert back to decimal
         }
     })
 
@@ -580,12 +618,22 @@ def save_configuration():
     """Save configuration changes."""
     try:
         if 'config_updates' in st.session_state:
-            # In a real implementation, you would save to a config file or database
+            # Update the global CONFIG with session state changes
+            updates = st.session_state.config_updates
+            
+            for section, section_updates in updates.items():
+                if section in CONFIG:
+                    CONFIG[section].update(section_updates)
+            
             st.success("✅ Configuration saved successfully!")
+            st.info("💡 Changes will take effect on next backtest run")
             
             # Show summary of changes
             with st.expander("📋 Configuration Summary"):
                 st.json(st.session_state.config_updates)
+                
+            # Clear session state after saving
+            st.session_state.config_updates = {}
         else:
             st.warning("No configuration changes to save.")
     

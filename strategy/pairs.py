@@ -83,10 +83,10 @@ class PairSelector:
             completed_count = 0
             total_pairs = len(pair_combinations)
         
-            # Test first 10 pairs sequentially for debugging
-            logger.info(f"Testing first 10 pairs sequentially for debugging...")
-            for i, pair in enumerate(pair_combinations[:10]):
-                logger.info(f"Testing pair {i+1}/10: {pair[0]} - {pair[1]}")
+            # Test first 3 pairs sequentially for debugging (reduced for speed)
+            logger.info(f"Testing first 3 pairs sequentially for debugging...")
+            for i, pair in enumerate(pair_combinations[:3]):
+                logger.info(f"Testing pair {i+1}/3: {pair[0]} - {pair[1]}")
                 try:
                     result = self._test_single_pair(pair[0], pair[1], start_date, end_date)
                     if result and result.get('is_cointegrated', False):
@@ -304,8 +304,9 @@ class PairSelector:
         min_correlation = min_correlation or self.config.get('min_correlation', 0.7)
         same_sector_only = same_sector_only or self.config.get('sector_matching', False)
         
-        # Calculate minimum data points for this analysis
-        min_data_points = max(50, int(self.config.get('lookback_window', 252) * 0.7))
+        # Calculate minimum data points for this analysis - use flexible threshold
+        # Since this is for backtest formation period, use a more lenient requirement
+        min_data_points = max(50, 100)  # Fixed minimum requirement instead of percentage
         
         logger.info(f"Filtering {len(pairs)} pairs with criteria: "
                    f"half_life: {min_half_life}-{max_half_life}, "

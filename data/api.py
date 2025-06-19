@@ -70,16 +70,35 @@ class MarketDataAPI:
                       adjust_prices: bool = True) -> pd.DataFrame:
         """Get synchronized price data for a pair of symbols."""
         try:
+            # Debug first few calls
+            if not hasattr(self, '_debug_pairs_data_count'):
+                self._debug_pairs_data_count = 0
+            self._debug_pairs_data_count += 1
+            
+            if self._debug_pairs_data_count <= 3:
+                logger.info(f"DEBUG PAIRS DATA #{self._debug_pairs_data_count}: Getting data for {symbol1}-{symbol2} from {start_date} to {end_date}")
+            
             data = self.get_price_data([symbol1, symbol2], start_date, end_date, adjust_prices)
+            
+            if self._debug_pairs_data_count <= 3:
+                logger.info(f"DEBUG: Raw data shape: {data.shape}")
             
             if data.empty or len(data.columns) < 2:
                 return pd.DataFrame()
             
             # Drop rows with any NaN values for pairs analysis
+            data_before_dropna = len(data)
             data = data.dropna()
             
-            if len(data) < 30:  # Minimum data points for analysis
-                logger.warning(f"Insufficient data for pair {symbol1}-{symbol2}: {len(data)} points")
+            if self._debug_pairs_data_count <= 3:
+                logger.info(f"DEBUG: After dropna: {len(data)} points (was {data_before_dropna})")
+                if not data.empty:
+                    logger.info(f"DEBUG: Date range: {data.index[0]} to {data.index[-1]}")
+            
+            # Use flexible minimum based on context - during trading we need fewer points than formation
+            min_points = 30 if not hasattr(self, '_trading_context') else 15
+            if len(data) < min_points:
+                logger.warning(f"Insufficient data for pair {symbol1}-{symbol2}: {len(data)} points (need {min_points})")
                 return pd.DataFrame()
             
             return data

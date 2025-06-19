@@ -211,9 +211,11 @@ class DataStorageManager:
             }
             data.rename(columns=column_mapping, inplace=True)
             
-            # Remove extra columns that aren't in our schema
+            # Remove extra columns that aren't in our schema (like Dividends, Stock Splits)
             expected_columns = ['date', 'open', 'high', 'low', 'close', 'volume', 'adj_close', 'symbol']
-            data = data[expected_columns]
+            # Only keep columns that exist in both data and expected_columns
+            available_columns = [col for col in expected_columns if col in data.columns]
+            data = data[available_columns]
             
             # Insert data with duplicate handling
             try:

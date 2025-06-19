@@ -7,7 +7,9 @@
       "Bash(pip install:*)",
       "Bash(find:*)",
       "Bash(sqlite3:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(pip3:*)",
+      "Bash(grep:*)"
     ],
     "deny": []
   }

@@ -26,7 +26,7 @@ CONFIG = {
         'sector_matching': False,  # Cross-sector pairs allowed (diversification)
     },
     'trading': {
-        'entry_z_score': 1.5,  # Reduced from 2.0 for better signal generation
+        'entry_z_score': 1.0,  # Further reduced for more aggressive signal generation
         'exit_z_score': 0.5,  # Exit before mean (conservative approach)
         'stop_loss_z_score': 3.0,  # Risk management (3 std devs)
         'max_position_size': 0.05,  # 5% per pair (conservative, academic standard)
@@ -35,6 +35,7 @@ CONFIG = {
         'max_active_pairs': 20,  # Match with top_pairs for full utilization
         'force_close_missing_days': 14,  # Force close after X consecutive days without data
         'max_holding_period': 90,  # Maximum days to hold any position (timeout)
+        'execution_price_lookback_days': 25,  # Days to look back for price data during trade execution
     },
     'risk': {
         'max_drawdown': 0.15,

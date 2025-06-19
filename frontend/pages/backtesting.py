@@ -8,9 +8,12 @@ import plotly.graph_objects as go
 import plotly.express as px
 from datetime import datetime, timedelta
 import time
+import asyncio
+import threading
 
 from backtest.engine import BacktestEngine
 from data.api import MarketDataAPI
+from frontend.components.live_timeline import LiveTradeTimeline
 from frontend.utils import (
     create_equity_curve_chart, create_drawdown_chart, create_monthly_returns_heatmap,
     create_trade_analysis_chart, format_currency, format_percentage,
@@ -252,7 +255,13 @@ def run_backtest(start_date, end_date, universe, initial_capital, max_position_s
                 lookback_window, trading_window, rebalance_frequency, commission_rate,
                 p_value_threshold, min_correlation, min_half_life, max_half_life, 
                 top_pairs, sector_matching, force_close_missing_days, max_holding_period):
-    """Run the backtest with specified parameters."""
+    """Run the backtest with specified parameters and live timeline."""
+    
+    # Initialize live timeline
+    live_timeline = LiveTradeTimeline()
+    live_timeline.initialize_display()
+    live_timeline.log_backtest_start(start_date.strftime('%Y-%m-%d'), 
+                                   end_date.strftime('%Y-%m-%d'), initial_capital)
     
     # Create progress indicators
     progress_container = st.container()
@@ -304,6 +313,9 @@ def run_backtest(start_date, end_date, universe, initial_capital, max_position_s
             
             # Store update function in engine for callbacks
             engine.progress_callback = update_progress
+            
+            # Add live timeline callbacks
+            engine.live_timeline = live_timeline
             start_time = time.time()
             
             # Update configuration temporarily
@@ -336,6 +348,15 @@ def run_backtest(start_date, end_date, universe, initial_capital, max_position_s
             )
             
             if results:
+                # Finalize live timeline with results
+                final_stats = {
+                    'final_capital': results.get('final_capital', initial_capital),
+                    'total_return': results.get('total_return', 0),
+                    'total_trades': len(results.get('trades', [])),
+                    'win_rate': results.get('win_rate', 0)
+                }
+                live_timeline.finalize_backtest(final_stats)
+                
                 st.session_state.backtest_results = results
                 st.success("✅ Backtest completed successfully!")
             else:
@@ -534,12 +555,185 @@ def display_backtest_results():
             
             # Download trades
             download_dataframe_as_csv(display_trades_df, "trade_history.csv")
+        
+        # Trade Timeline with detailed analysis
+        st.subheader("📈 Trade Timeline & Analysis")
+        
+        # Create timeline with more details
+        timeline_df = trades_df.copy()
+        if 'entry_date' in timeline_df.columns:
+            timeline_df = timeline_df.sort_values('entry_date')
+            timeline_df['cumulative_pnl'] = timeline_df['pnl'].cumsum()
+            timeline_df['running_return'] = (timeline_df['cumulative_pnl'] / 100000) * 100  # Assuming 100k initial capital
+            
+            # Format for display
+            timeline_display = timeline_df.copy()
+            timeline_display['Entry Date'] = pd.to_datetime(timeline_display['entry_date']).dt.strftime('%Y-%m-%d')
+            timeline_display['Exit Date'] = pd.to_datetime(timeline_display['exit_date']).dt.strftime('%Y-%m-%d') if 'exit_date' in timeline_display.columns else 'N/A'
+            timeline_display['P&L'] = timeline_display['pnl'].apply(format_currency)
+            timeline_display['Cumulative P&L'] = timeline_display['cumulative_pnl'].apply(format_currency)
+            timeline_display['Running Return %'] = timeline_display['running_return'].apply(lambda x: f"{x:.2f}%")
+            timeline_display['Trade Return %'] = (timeline_display['pnl'] / timeline_display['capital_allocated'] * 100).apply(lambda x: f"{x:.2f}%")
+            
+            # Add trade ranking/position info
+            timeline_display['Trade #'] = range(1, len(timeline_display) + 1)
+            
+            # Color code profitable/losing trades
+            def color_pnl(val):
+                if 'P&L' in val.name:
+                    if val.startswith('$-'):
+                        return 'color: red'
+                    elif val.startswith('$') and val != '$0.00':
+                        return 'color: green'
+                return ''
+            
+            # Show timeline with key columns
+            timeline_columns = ['Trade #', 'pair_id', 'side', 'Entry Date', 'Exit Date', 'holding_days', 
+                              'P&L', 'Trade Return %', 'Cumulative P&L', 'Running Return %', 'exit_reason']
+            available_timeline_cols = [col for col in timeline_columns if col in timeline_display.columns]
+            
+            # Display with filtering options
+            col1, col2, col3 = st.columns(3)
+            with col1:
+                show_profitable_only = st.checkbox("Show profitable trades only")
+            with col2:
+                show_recent_only = st.selectbox("Show trades", ["All", "Last 50", "Last 20", "Last 10"])
+            with col3:
+                pair_filter = st.selectbox("Filter by pair", ["All"] + list(timeline_display['pair_id'].unique()))
+            
+            # Apply filters
+            filtered_timeline = timeline_display.copy()
+            
+            if show_profitable_only:
+                filtered_timeline = filtered_timeline[filtered_timeline['pnl'] > 0]
+            
+            if pair_filter != "All":
+                filtered_timeline = filtered_timeline[filtered_timeline['pair_id'] == pair_filter]
+            
+            if show_recent_only != "All":
+                n_trades = int(show_recent_only.split()[-1])
+                filtered_timeline = filtered_timeline.tail(n_trades)
+            
+            # Style the dataframe
+            styled_timeline = filtered_timeline[available_timeline_cols].style.applymap(
+                lambda x: 'color: red' if isinstance(x, str) and x.startswith('$-') else 
+                         ('color: green' if isinstance(x, str) and x.startswith('$') and x != '$0.00' else ''),
+                subset=['P&L', 'Cumulative P&L']
+            ).applymap(
+                lambda x: 'color: red' if isinstance(x, str) and x.startswith('-') else 
+                         ('color: green' if isinstance(x, str) and not x.startswith('-') and '%' in x and x != '0.00%' else ''),
+                subset=['Trade Return %', 'Running Return %']
+            )
+            
+            st.dataframe(styled_timeline, use_container_width=True, height=400)
+            
+            # Trade summary stats for filtered data
+            if not filtered_timeline.empty:
+                st.subheader("📊 Filtered Trade Statistics")
+                col1, col2, col3, col4 = st.columns(4)
+                
+                with col1:
+                    st.metric("Total Trades", len(filtered_timeline))
+                with col2:
+                    winning_trades = len(filtered_timeline[filtered_timeline['pnl'] > 0])
+                    st.metric("Winning Trades", f"{winning_trades} ({winning_trades/len(filtered_timeline)*100:.1f}%)")
+                with col3:
+                    total_pnl_filtered = filtered_timeline['pnl'].sum()
+                    st.metric("Total P&L", format_currency(total_pnl_filtered))
+                with col4:
+                    avg_return = (filtered_timeline['pnl'] / filtered_timeline['capital_allocated'] * 100).mean()
+                    st.metric("Avg Return %", f"{avg_return:.2f}%")
     
     else:
         st.info("No trade data available in backtest results.")
     
     # Pair performance analysis
-    st.subheader("🔍 Pair Performance")
+    st.subheader("🔍 Pair Performance & Rankings")
+    
+    # Add pair performance ranking if trades exist
+    if trades_df is not None and not trades_df.empty:
+        st.subheader("🏆 Top Performing Pairs")
+        
+        # Calculate pair performance metrics
+        pair_performance = trades_df.groupby('pair_id').agg({
+            'pnl': ['sum', 'count', 'mean', 'std'],
+            'capital_allocated': 'mean',
+            'holding_days': 'mean'
+        }).round(2)
+        
+        # Flatten column names
+        pair_performance.columns = ['Total_PnL', 'Trade_Count', 'Avg_PnL', 'PnL_Std', 'Avg_Capital', 'Avg_Holding_Days']
+        pair_performance['Win_Rate'] = trades_df.groupby('pair_id')['pnl'].apply(lambda x: (x > 0).sum() / len(x) * 100).round(1)
+        pair_performance['Total_Return_Pct'] = (pair_performance['Total_PnL'] / pair_performance['Avg_Capital'] * 100).round(2)
+        pair_performance['Sharpe_Ratio'] = (pair_performance['Avg_PnL'] / pair_performance['PnL_Std']).round(2)
+        
+        # Sort by total P&L
+        pair_performance = pair_performance.sort_values('Total_PnL', ascending=False)
+        
+        # Format for display
+        pair_display = pair_performance.copy()
+        pair_display['Total P&L'] = pair_display['Total_PnL'].apply(format_currency)
+        pair_display['Avg P&L'] = pair_display['Avg_PnL'].apply(format_currency)
+        pair_display['Avg Capital'] = pair_display['Avg_Capital'].apply(format_currency)
+        pair_display['Win Rate %'] = pair_display['Win_Rate'].apply(lambda x: f"{x:.1f}%")
+        pair_display['Total Return %'] = pair_display['Total_Return_Pct'].apply(lambda x: f"{x:.2f}%")
+        pair_display['Avg Holding Days'] = pair_display['Avg_Holding_Days'].apply(lambda x: f"{x:.1f}")
+        
+        # Show top and bottom performers
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.write("**🔥 Top 10 Performers**")
+            top_pairs = pair_display.head(10)[['Total P&L', 'Trade_Count', 'Win Rate %', 'Total Return %', 'Avg Holding Days']]
+            top_pairs.columns = ['Total P&L', 'Trades', 'Win Rate', 'Return %', 'Avg Days']
+            st.dataframe(top_pairs, use_container_width=True)
+        
+        with col2:
+            st.write("**❄️ Bottom 10 Performers**")
+            bottom_pairs = pair_display.tail(10)[['Total P&L', 'Trade_Count', 'Win Rate %', 'Total Return %', 'Avg Holding Days']]
+            bottom_pairs.columns = ['Total P&L', 'Trades', 'Win Rate', 'Return %', 'Avg Days']
+            st.dataframe(bottom_pairs, use_container_width=True)
+        
+        # Detailed pair analysis
+        st.subheader("📈 Detailed Pair Analysis")
+        selected_pair = st.selectbox("Select pair for detailed analysis", pair_display.index.tolist())
+        
+        if selected_pair:
+            pair_trades = trades_df[trades_df['pair_id'] == selected_pair].copy()
+            pair_trades = pair_trades.sort_values('entry_date' if 'entry_date' in pair_trades.columns else pair_trades.index)
+            
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                st.metric("Total Trades", len(pair_trades))
+            with col2:
+                total_pnl = pair_trades['pnl'].sum()
+                st.metric("Total P&L", format_currency(total_pnl))
+            with col3:
+                win_rate = (pair_trades['pnl'] > 0).sum() / len(pair_trades) * 100
+                st.metric("Win Rate", f"{win_rate:.1f}%")
+            with col4:
+                avg_return = (pair_trades['pnl'] / pair_trades['capital_allocated'] * 100).mean()
+                st.metric("Avg Return", f"{avg_return:.2f}%")
+            
+            # Show trade timeline for selected pair
+            pair_trades['Cumulative P&L'] = pair_trades['pnl'].cumsum()
+            pair_trades['Trade #'] = range(1, len(pair_trades) + 1)
+            
+            # Plot cumulative P&L for this pair
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                x=pair_trades['Trade #'],
+                y=pair_trades['Cumulative P&L'],
+                mode='lines+markers',
+                name=f'{selected_pair} Cumulative P&L',
+                line=dict(color='blue' if total_pnl > 0 else 'red')
+            ))
+            fig.update_layout(
+                title=f"Cumulative P&L for {selected_pair}",
+                xaxis_title="Trade Number",
+                yaxis_title="Cumulative P&L ($)"
+            )
+            st.plotly_chart(fig, use_container_width=True)
     
     pair_history = results.get('pair_history', [])
     

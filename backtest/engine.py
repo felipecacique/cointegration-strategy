@@ -97,10 +97,13 @@ class BacktestEngine:
             portfolio_values = []
             period_count = 0
             
-            # Calculate total periods for progress tracking
-            total_periods = int((end_dt - start_dt).days / self.rebalance_frequency) + 1
+            # Calculate total periods for progress tracking  
+            total_periods = int((end_dt - start_dt).days / self.rebalance_frequency)
+            expected_end = start_dt + timedelta(days=total_periods * self.rebalance_frequency)
+            logger.info(f"Planning {total_periods} rebalancing periods, expected end: {expected_end.strftime('%Y-%m-%d')}")
+            logger.info(f"Requested period: {start_date} to {end_date} ({(end_dt - start_dt).days} days)")
             
-            while current_date <= end_dt:
+            while current_date <= end_dt and period_count < total_periods:
                 period_count += 1
                 try:
                     # Update progress
@@ -128,13 +131,39 @@ class BacktestEngine:
                             'top_pairs': pairs[:self.top_pairs]
                         })
                         
-                        logger.info(f"Found {len(pairs)} cointegrated pairs for period ending {current_date.strftime('%Y-%m-%d')}")
+                        logger.info(f"COINTEGRATION ANALYSIS: Found {len(pairs)} pairs for period ending {current_date.strftime('%Y-%m-%d')}")
+                        
+                        # Log top pairs with their statistics
+                        logger.info(f"TOP {min(self.top_pairs, len(pairs))} PAIRS RANKING:")
+                        for i, pair in enumerate(pairs[:self.top_pairs]):
+                            # Try different possible key names for p-value
+                            p_value = pair.get('coint_pvalue', pair.get('p_value', 'N/A'))
+                            adf_stat = pair.get('coint_statistic', pair.get('adf_statistic', 'N/A'))
+                            correlation = pair.get('correlation', 'N/A')
+                            half_life = pair.get('half_life', 'N/A')
+                            
+                            # Format numbers if they exist
+                            if isinstance(p_value, (int, float)):
+                                p_value = f"{p_value:.4f}"
+                            if isinstance(adf_stat, (int, float)):
+                                adf_stat = f"{adf_stat:.3f}"
+                            if isinstance(correlation, (int, float)):
+                                correlation = f"{correlation:.3f}"
+                            if isinstance(half_life, (int, float)):
+                                half_life = f"{half_life:.1f}"
+                            
+                            logger.info(f"  {i+1}. {pair['symbol1']}-{pair['symbol2']} | p-val: {p_value} | ADF: {adf_stat} | corr: {correlation} | half-life: {half_life}")
                         
                         # Trading period: generate signals and manage positions
                         trading_end = min(
                             current_date + timedelta(days=self.trading_window),
                             end_dt
                         )
+                        
+                        # Skip if trading period would be too short or extend beyond end date
+                        if trading_end <= current_date + timedelta(days=7):  # At least 1 week of trading
+                            logger.info(f"Skipping final period {current_date.strftime('%Y-%m-%d')} - insufficient trading window")
+                            break
                         
                         # Execute trading for this period
                         period_results = self._execute_trading_period(
@@ -163,6 +192,8 @@ class BacktestEngine:
                     logger.error(f"Error processing date {current_date}: {e}")
                     current_date += timedelta(days=self.rebalance_frequency)
                     continue
+            
+            logger.info(f"Backtest loop completed: {period_count} periods processed, final date: {current_date.strftime('%Y-%m-%d')}")
             
             # Create equity curve
             if portfolio_values:
@@ -196,9 +227,21 @@ class BacktestEngine:
             
             self.results = results
             
-            logger.info(f"Backtest completed. Total return: {results['total_return']:.2%}, "
-                       f"Sharpe ratio: {results['sharpe_ratio']:.2f}, "
-                       f"Max drawdown: {results['max_drawdown']:.2%}")
+            # Detailed performance summary
+            logger.info("=" * 80)
+            logger.info("BACKTEST RESULTS SUMMARY")
+            logger.info("=" * 80)
+            logger.info(f"Period: {start_date} to {end_date}")
+            logger.info(f"Initial Capital: ${self.initial_capital:,.2f}")
+            logger.info(f"Final Capital: ${results['final_capital']:,.2f}")
+            logger.info(f"Total Return: {results['total_return']:.2%}")
+            logger.info(f"Annualized Return: {results['annualized_return']:.2%}")
+            logger.info(f"Max Drawdown: {results['max_drawdown']:.2%}")
+            logger.info(f"Sharpe Ratio: {results['sharpe_ratio']:.2f}")
+            logger.info(f"Total Trades: {results['total_trades']}")
+            logger.info(f"Winning Trades: {results['winning_trades']}")
+            logger.info(f"Win Rate: {results['win_rate']:.1f}%")
+            logger.info("=" * 80)
             
             return results
             
@@ -305,6 +348,10 @@ class BacktestEngine:
             
             period_trades = []
             
+            # Hook for live timeline - log trading day start
+            if hasattr(self, 'live_timeline') and self.live_timeline:
+                self.live_timeline.log_trading_day(trading_dates[0].strftime('%Y-%m-%d'), len(pairs))
+            
             for date in trading_dates:
                 try:
                     date_str = date.strftime('%Y-%m-%d')
@@ -339,6 +386,14 @@ class BacktestEngine:
                                 logger.error(f"Error in force-close: {e}")
                     
                     # Generate signals for all pairs
+                    logger.info(f"Starting trading simulation for {len(pairs)} pairs on {date_str}")
+                    trading_attempts = 0
+                    successful_trades = 0
+                    
+                    # Reset debug counters for each trading day to capture details
+                    self._debug_trading_count = 0
+                    self._debug_execute_count = 0
+                    
                     for pair in pairs:
                         symbol1 = pair['symbol1']
                         symbol2 = pair['symbol2']
@@ -350,11 +405,13 @@ class BacktestEngine:
                         current_position = self.position_manager.get_position(pair_id)
                         position_side = current_position.get('side', PositionSide.FLAT)
                         
-                        # Calculate current spread and z-score with reduced lookback
-                        lookback_days = 15  # Reduced from 30 to 15 days
+                        # Calculate current spread and z-score with dynamic lookback
+                        # Use available data within reasonable period (extend to get ~30 business days)
+                        lookback_start = date - timedelta(days=45)  # Use 45 days to get ~30 business days
+                        actual_lookback_days = (date - lookback_start).days
                         spread = self.signal_generator.calculate_spread(
                             symbol1, symbol2, hedge_ratio, intercept,
-                            (date - timedelta(days=lookback_days)).strftime('%Y-%m-%d'),
+                            lookback_start.strftime('%Y-%m-%d'),
                             date_str
                         )
                         
@@ -364,7 +421,11 @@ class BacktestEngine:
                             position.update_monitoring_status(date_str, not spread.empty)
                         
                         if spread.empty:
-                            logger.debug(f"Skipping {pair_id} on {date_str}: insufficient spread data (need {lookback_days} days)")
+                            if not hasattr(self, '_debug_spread_count'):
+                                self._debug_spread_count = 0
+                            self._debug_spread_count += 1
+                            if self._debug_spread_count <= 5:
+                                logger.info(f"DEBUG SPREAD #{self._debug_spread_count}: {pair_id} on {date_str} - insufficient spread data from {lookback_start.strftime('%Y-%m-%d')} to {date_str} ({actual_lookback_days} calendar days)")
                             continue
                         
                         # Calculate z-score
@@ -376,7 +437,18 @@ class BacktestEngine:
                         
                         current_z_score = z_score.iloc[-1]
                         
-                        current_z_score = z_score.iloc[-1]
+                        # Enhanced debug logging for trading attempts
+                        if not hasattr(self, '_debug_trading_count'):
+                            self._debug_trading_count = 0
+                        self._debug_trading_count += 1
+                        
+                        # Debug first few pairs each day
+                        debug_this_pair = self._debug_trading_count <= 3
+                        
+                        if debug_this_pair:
+                            logger.info(f"🔍 DEBUG TRADING #{self._debug_trading_count}: {pair_id} on {date_str}")
+                            logger.info(f"   Z-score: {current_z_score:.3f} | Position: {position_side}")
+                            logger.info(f"   Spread data points: {len(spread)} | Z-score data points: {len(z_score)}")
                         
                         # Generate signal
                         signals = self.signal_generator.generate_signals(
@@ -384,23 +456,60 @@ class BacktestEngine:
                         )
                         
                         if signals.empty:
-                            logger.debug(f"Skipping {pair_id} on {date_str}: no signals generated (z-score: {current_z_score:.2f})")
+                            if debug_this_pair:
+                                entry_threshold = CONFIG['trading']['entry_z_score']
+                                logger.info(f"   ❌ NO SIGNALS: z-score {current_z_score:.3f} doesn't meet entry threshold ±{entry_threshold}")
+                                logger.info(f"   Need: |z-score| > {entry_threshold}, Got: |{current_z_score:.3f}| = {abs(current_z_score):.3f}")
                             continue
                         
                         current_signal = signals.iloc[-1]
                         
-                        # Execute trades based on signals
+                        if debug_this_pair:
+                            logger.info(f"   ✅ SIGNAL GENERATED: {current_signal} (z-score: {current_z_score:.3f})")
+                            logger.info(f"   Proceeding to trade execution...")
+                        
                         trade_result = self._execute_signal(
                             pair_id, symbol1, symbol2, current_signal,
                             current_z_score, hedge_ratio, date_str
                         )
                         
+                        trading_attempts += 1
+                        
                         if trade_result:
+                            successful_trades += 1
                             period_trades.append(trade_result)
                             self.trades_history.append(trade_result)
-                            logger.info(f"Executed trade for {pair_id}: {trade_result.get('action', 'UNKNOWN')} signal on {date_str}")
+                            
+                            # Detailed trade logging
+                            action = trade_result.get('action', 'UNKNOWN')
+                            side = trade_result.get('side', 'UNKNOWN')
+                            pnl = trade_result.get('pnl', 0)
+                            value = trade_result.get('value', 0)
+                            
+                            if action == 'OPEN':
+                                logger.info(f"TRADE OPENED: {pair_id} | {side} | Value: ${value:,.2f} | Z-Score: {current_z_score:.2f} | Date: {date_str}")
+                            elif action == 'CLOSE':
+                                logger.info(f"TRADE CLOSED: {pair_id} | PnL: ${pnl:,.2f} | Z-Score: {current_z_score:.2f} | Date: {date_str}")
+                            
+                            # Portfolio status after trade
+                            portfolio_value = self.position_manager.get_portfolio_value()
+                            open_positions = len(self.position_manager.positions)
+                            logger.info(f"Portfolio Value: ${portfolio_value:,.2f} | Open Positions: {open_positions}")
                         else:
-                            logger.debug(f"Trade execution failed for {pair_id} on {date_str}: signal={current_signal}, z-score={current_z_score:.2f}")
+                            if debug_this_pair:
+                                logger.info(f"   ❌ TRADE EXECUTION FAILED for {pair_id} on {date_str}")
+                                logger.info(f"   Signal: {current_signal} | Z-score: {current_z_score:.3f}")
+                                logger.info(f"   Checking _execute_signal for detailed failure reason...")
+                    
+                    # Enhanced trading day summary
+                    if trading_attempts > 0:
+                        success_rate = (successful_trades / trading_attempts) * 100
+                        logger.info(f"📊 Trading day {date_str} summary: {trading_attempts} attempts, {successful_trades} successful trades ({success_rate:.1f}% success)")
+                        
+                        if successful_trades == 0 and trading_attempts > 0:
+                            logger.info(f"⚠️  All {trading_attempts} trade attempts failed - check logs above for failure reasons")
+                    else:
+                        logger.info(f"📊 Trading day {date_str} summary: No trading attempts made")
                 
                 except Exception as e:
                     logger.error(f"Error processing trading date {date}: {e}")
@@ -445,26 +554,65 @@ class BacktestEngine:
                        date: str) -> Optional[Dict[str, Any]]:
         """Execute a trading signal."""
         try:
+            # Enhanced debug for signal execution
+            if not hasattr(self, '_debug_execute_count'):
+                self._debug_execute_count = 0
+            self._debug_execute_count += 1
+            
+            debug_this_execution = self._debug_execute_count <= 3
+            
+            if debug_this_execution:
+                logger.info(f"🎯 EXECUTE SIGNAL #{self._debug_execute_count}: {pair_id}")
+                logger.info(f"   Signal: {signal} | Z-score: {z_score:.3f} | Date: {date}")
+            
             if signal == SignalType.NO_SIGNAL:
+                if debug_this_execution:
+                    logger.info(f"   ❌ SKIPPED: NO_SIGNAL received")
                 return None
             
-            # Get current prices
-            price_data = self.data_api.get_pairs_data(symbol1, symbol2, date, date)
+            # Get current prices (with flexible lookback for execution)
+            execution_lookback_days = CONFIG['trading'].get('execution_price_lookback_days', 7)
+            price_start_date = pd.to_datetime(date) - timedelta(days=execution_lookback_days)
+            price_start_str = price_start_date.strftime('%Y-%m-%d')
+            
+            if debug_this_execution:
+                logger.info(f"   📊 Getting price data for {symbol1}, {symbol2} from {price_start_str} to {date} (execution lookback: {execution_lookback_days} days)")
+            
+            # Force trading context for price execution
+            self.data_api._trading_context = True
+            price_data = self.data_api.get_pairs_data(symbol1, symbol2, price_start_str, date)
+            # Clear trading context
+            if hasattr(self.data_api, '_trading_context'):
+                delattr(self.data_api, '_trading_context')
             
             if price_data.empty:
+                if debug_this_execution:
+                    logger.info(f"   ❌ FAILED: No price data available for {pair_id} on {date}")
                 return None
             
             price1 = price_data[symbol1].iloc[-1]
             price2 = price_data[symbol2].iloc[-1]
+            
+            if debug_this_execution:
+                logger.info(f"   💰 Prices: {symbol1}=${price1:.2f}, {symbol2}=${price2:.2f}")
             
             # Calculate position size
             portfolio_value = self.position_manager.get_portfolio_value()
             max_position_size = CONFIG['trading']['max_position_size']
             position_value = portfolio_value * max_position_size
             
+            if debug_this_execution:
+                logger.info(f"   💼 Portfolio: ${portfolio_value:,.2f} | Max size: {max_position_size:.1%} | Position value: ${position_value:,.2f}")
+            
             # Risk check
-            if not self.risk_manager.check_position_size(pair_id, position_value):
+            risk_check = self.risk_manager.check_position_size(pair_id, position_value)
+            if not risk_check:
+                if debug_this_execution:
+                    logger.info(f"   ❌ FAILED: Risk management REJECTED position for {pair_id}")
                 return None
+            
+            if debug_this_execution:
+                logger.info(f"   ✅ Risk check PASSED for {pair_id}")
             
             trade_result = None
             
@@ -472,17 +620,26 @@ class BacktestEngine:
                 # Open new position
                 side = PositionSide.LONG if signal == SignalType.ENTRY_LONG else PositionSide.SHORT
                 
+                if debug_this_execution:
+                    logger.info(f"   🚀 Attempting to OPEN {side} position for {pair_id}")
+                
                 trade_result = self.position_manager.open_position(
                     pair_id, symbol1, symbol2, side, position_value,
                     price1, price2, hedge_ratio, date
                 )
                 
                 if trade_result:
+                    if debug_this_execution:
+                        logger.info(f"   ✅ SUCCESS: Position opened successfully")
+                        logger.info(f"   Trade details: {trade_result}")
                     trade_result.update({
                         'signal': signal,
                         'z_score': z_score,
                         'action': 'OPEN'
                     })
+                else:
+                    if debug_this_execution:
+                        logger.info(f"   ❌ FAILED: Position opening REJECTED by position manager")
             
             elif signal in [SignalType.EXIT_LONG, SignalType.EXIT_SHORT, SignalType.STOP_LOSS]:
                 # Close existing position

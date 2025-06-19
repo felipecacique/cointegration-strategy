@@ -493,7 +493,7 @@ def create_trade_analysis_chart(trades_df, title="Trade Analysis"):
     
     fig = go.Figure()
     fig.add_trace(go.Scatter(
-        x=range(len(cumulative_pnl)),
+        x=list(range(len(cumulative_pnl))),
         y=cumulative_pnl,
         mode='lines+markers',
         name='Cumulative P&L'
